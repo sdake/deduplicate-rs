@@ -422,6 +422,25 @@ impl MediaDeduplicator {
         writeln!(file, "# Be careful with these operations to avoid name conflicts")?;
         writeln!(file, "")?;
         
+        // Create a set of files that are duplicates within the same directory
+        let mut duplicate_files = HashSet::new();
+        for (dir, checksums) in &self.dir_dupes {
+            for checksum in checksums {
+                let all_files = self.checksum_to_files.get(checksum).unwrap();
+                
+                let dir_files: Vec<&String> = all_files.iter()
+                    .filter(|&file| self.get_dir_path(file) == *dir)
+                    .collect();
+                
+                if dir_files.len() > 1 {
+                    // These are duplicates within the same directory
+                    for &file_path in &dir_files {
+                        duplicate_files.insert(file_path.to_string());
+                    }
+                }
+            }
+        }
+        
         for dir_path in dirs {
             let dir_name = self.get_relative_path(dir_path);
             let display_name = if dir_name.is_empty() { "root".to_string() } else { dir_name.clone() };
@@ -441,7 +460,9 @@ impl MediaDeduplicator {
                                 .to_string_lossy()
                                 .into_owned();
                             
-                            if self.has_numeric_suffix(&filename) {
+                            // Only consider renaming files that are duplicates
+                            let path_str = path.to_string_lossy().into_owned();
+                            if self.has_numeric_suffix(&filename) && duplicate_files.contains(&path_str) {
                                 rename_files.push(path);
                             }
                         }
