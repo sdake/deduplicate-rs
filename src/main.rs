@@ -14,11 +14,13 @@ use sysinfo::{System, SystemExt, ProcessExt};
 use walkdir::WalkDir;
 use twox_hash::xxh3::hash64;
 use blake3;
+use t1ha::t1ha0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HashType {
     XXH3,
     Blake3,
+    T1HA,
 }
 
 impl std::fmt::Display for HashType {
@@ -26,6 +28,7 @@ impl std::fmt::Display for HashType {
         match self {
             HashType::XXH3 => write!(f, "XXH3"),
             HashType::Blake3 => write!(f, "Blake3"),
+            HashType::T1HA => write!(f, "T1HA"),
         }
     }
 }
@@ -37,6 +40,7 @@ impl std::str::FromStr for HashType {
         match s.to_lowercase().as_str() {
             "xxh3" => Ok(HashType::XXH3),
             "blake3" => Ok(HashType::Blake3),
+            "t1ha" => Ok(HashType::T1HA),
             _ => Err(format!("Unknown hash type: {}", s)),
         }
     }
@@ -48,7 +52,7 @@ struct Args {
     #[arg(short, long)]
     filepath: Option<PathBuf>,
     
-    #[arg(short = 'a', long, default_value = "xxh3", help = "Hash algorithm to use (xxh3, blake3)")]
+    #[arg(short = 'a', long, default_value = "xxh3", help = "Hash algorithm to use (xxh3, blake3, t1ha)")]
     hash: HashType,
 }
 
@@ -93,6 +97,7 @@ impl MediaDeduplicator {
         let db_name = match hash_type {
             HashType::XXH3 => "xxh3sum.txt",
             HashType::Blake3 => "blake3sum.txt",
+            HashType::T1HA => "t1hasum.txt",
         };
         
         Ok(Self {
@@ -652,6 +657,11 @@ impl MediaDeduplicator {
                 // Use Blake3 which is optimized for modern CPUs with SIMD
                 let hash_value = blake3::hash(&buffer);
                 hash_value.to_hex().to_string()
+            },
+            HashType::T1HA => {
+                // Use T1HA (Fast Positive Hash)
+                let hash_value = t1ha0(&buffer, 0);
+                format!("{:016x}", hash_value)
             }
         };
         
