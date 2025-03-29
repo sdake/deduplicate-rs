@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use bytesize::ByteSize;
 use chrono::Local;
 use clap::Parser;
+use twox_hash::xxh3::hash128;
 use humantime::format_duration;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -18,15 +19,17 @@ use t1ha::t1ha0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HashType {
-    XXH3,
-    Blake3,
-    T1HA,
+    XXH3,      // Fast, non-cryptographic 64-bit hash
+    XXH3_128,  // Fast, non-cryptographic 128-bit hash
+    Blake3,    // Cryptographically secure hash
+    T1HA,      // Fast Positive Hash
 }
 
 impl std::fmt::Display for HashType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HashType::XXH3 => write!(f, "XXH3"),
+            HashType::XXH3_128 => write!(f, "XXH3-128"),
             HashType::Blake3 => write!(f, "Blake3"),
             HashType::T1HA => write!(f, "T1HA"),
         }
@@ -39,6 +42,7 @@ impl std::str::FromStr for HashType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "xxh3" => Ok(HashType::XXH3),
+            "xxh3-128" | "xxh128" => Ok(HashType::XXH3_128),
             "blake3" => Ok(HashType::Blake3),
             "t1ha" => Ok(HashType::T1HA),
             _ => Err(format!("Unknown hash type: {}", s)),
@@ -52,13 +56,14 @@ struct Args {
     #[arg(short, long)]
     filepath: Option<PathBuf>,
     
-    #[arg(short = 'a', long, default_value = "xxh3", help = "Hash algorithm to use (xxh3, blake3, t1ha)")]
+    #[arg(short = 'a', long, default_value = "xxh3", help = "Hash algorithm to use (xxh3, xxh3-128, blake3, t1ha)")]
     hash: HashType,
 }
 
 const VIDEO_FORMATS: [&str; 11] = [
     "mp4", "flv", "mkv", "avi", "mov", "wmv", "webm", "m4v", "mpg", "mpeg", "ts",
 ];
+
 
 struct MediaDeduplicator {
     root_path: PathBuf,
@@ -96,6 +101,7 @@ impl MediaDeduplicator {
         // Use a different database filename based on hash type
         let db_name = match hash_type {
             HashType::XXH3 => "xxh3sum.txt",
+            HashType::XXH3_128 => "xxh3_128sum.txt",
             HashType::Blake3 => "blake3sum.txt",
             HashType::T1HA => "t1hasum.txt",
         };
@@ -652,6 +658,11 @@ impl MediaDeduplicator {
                 // Use XXH3 hash64 which is extremely fast
                 let hash_value = hash64(&buffer);
                 format!("{:016x}", hash_value)
+            },
+            HashType::XXH3_128 => {
+                // Use XXH3 128-bit hash for better collision resistance
+                let hash_value = hash128(&buffer);
+                format!("{:032x}", hash_value)
             },
             HashType::Blake3 => {
                 // Use Blake3 which is optimized for modern CPUs with SIMD
