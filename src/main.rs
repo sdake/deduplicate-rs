@@ -13,12 +13,43 @@ use std::time::{Duration, Instant};
 use sysinfo::{System, SystemExt, ProcessExt};
 use walkdir::WalkDir;
 use twox_hash::xxh3::hash64;
+use blake3;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HashType {
+    XXH3,
+    Blake3,
+}
+
+impl std::fmt::Display for HashType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HashType::XXH3 => write!(f, "XXH3"),
+            HashType::Blake3 => write!(f, "Blake3"),
+        }
+    }
+}
+
+impl std::str::FromStr for HashType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "xxh3" => Ok(HashType::XXH3),
+            "blake3" => Ok(HashType::Blake3),
+            _ => Err(format!("Unknown hash type: {}", s)),
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Media File Deduplication Tool")]
 struct Args {
     #[arg(short, long)]
     filepath: Option<PathBuf>,
+    
+    #[arg(short = 'a', long, default_value = "xxh3", help = "Hash algorithm to use (xxh3, blake3)")]
+    hash: HashType,
 }
 
 const VIDEO_FORMATS: [&str; 11] = [
@@ -43,6 +74,9 @@ struct MediaDeduplicator {
     cross_dir_dupes_count: usize,
     rename_candidates: usize,
     
+    // Hash configuration
+    hash_type: HashType,
+    
     // Performance metrics
     start_time: Instant,
     hashing_time: Duration,
@@ -52,12 +86,19 @@ struct MediaDeduplicator {
 }
 
 impl MediaDeduplicator {
-    fn new() -> Result<Self> {
+    fn new(hash_type: HashType) -> Result<Self> {
         let current_dir = env::current_dir()?;
+        
+        // Use a different database filename based on hash type
+        let db_name = match hash_type {
+            HashType::XXH3 => "xxh3sum.txt",
+            HashType::Blake3 => "blake3sum.txt",
+        };
+        
         Ok(Self {
             root_path: current_dir.clone(),
             script_dir: current_dir.clone(),
-            checksum_db_path: current_dir.join("sha256sum.txt"),
+            checksum_db_path: current_dir.join(db_name),
             destructive_script_path: current_dir.join("potentially-destructive-remove.sh"),
             
             checksum_to_file: HashMap::new(),
@@ -71,6 +112,9 @@ impl MediaDeduplicator {
             same_dir_dupes: 0,
             cross_dir_dupes_count: 0,
             rename_candidates: 0,
+            
+            // Initialize hash type
+            hash_type,
             
             // Initialize performance metrics
             start_time: Instant::now(),
@@ -535,7 +579,7 @@ impl MediaDeduplicator {
         };
         let memory_usage = ByteSize(self.peak_memory_usage);
         
-        println!("=== Performance Metrics ===");
+        println!("=== Performance Metrics ({}) ===", self.hash_type);
         println!("Total runtime: {}", format_duration(total_time));
         println!("Hashing time: {}", format_duration(self.hashing_time));
         println!("Data processed: {}", bytes_processed);
@@ -597,8 +641,19 @@ impl MediaDeduplicator {
         // Add to total bytes processed
         self.total_bytes_processed += bytes_read as u64;
         
-        // Use XXH3 hash64 which is extremely fast
-        let hash_value = hash64(&buffer);
+        // Calculate hash based on the selected algorithm
+        let hash_string = match self.hash_type {
+            HashType::XXH3 => {
+                // Use XXH3 hash64 which is extremely fast
+                let hash_value = hash64(&buffer);
+                format!("{:016x}", hash_value)
+            },
+            HashType::Blake3 => {
+                // Use Blake3 which is optimized for modern CPUs with SIMD
+                let hash_value = blake3::hash(&buffer);
+                hash_value.to_hex().to_string()
+            }
+        };
         
         // Track hashing time
         let elapsed = hash_start.elapsed();
@@ -614,8 +669,7 @@ impl MediaDeduplicator {
             }
         }
         
-        // Convert to hex string format
-        Ok(format!("{:016x}", hash_value))
+        Ok(hash_string)
     }
     
     fn get_relative_path(&self, path: &Path) -> String {
@@ -680,7 +734,7 @@ impl MediaDeduplicator {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut deduplicator = MediaDeduplicator::new()?;
+    let mut deduplicator = MediaDeduplicator::new(args.hash)?;
     deduplicator.run(args)?;
     Ok(())
 }
