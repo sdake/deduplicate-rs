@@ -1,12 +1,16 @@
 use anyhow::{anyhow, Result};
+use bytesize::ByteSize;
 use chrono::Local;
 use clap::Parser;
+use humantime::format_duration;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use sysinfo::{System, SystemExt, ProcessExt};
 use walkdir::WalkDir;
 use twox_hash::xxh3::hash64;
 
@@ -38,6 +42,13 @@ struct MediaDeduplicator {
     same_dir_dupes: usize,
     cross_dir_dupes_count: usize,
     rename_candidates: usize,
+    
+    // Performance metrics
+    start_time: Instant,
+    hashing_time: Duration,
+    total_bytes_processed: u64,
+    peak_memory_usage: u64,
+    system_info: System,
 }
 
 impl MediaDeduplicator {
@@ -60,6 +71,13 @@ impl MediaDeduplicator {
             same_dir_dupes: 0,
             cross_dir_dupes_count: 0,
             rename_candidates: 0,
+            
+            // Initialize performance metrics
+            start_time: Instant::now(),
+            hashing_time: Duration::from_secs(0),
+            total_bytes_processed: 0,
+            peak_memory_usage: 0,
+            system_info: System::new_all(),
         })
     }
     
@@ -383,7 +401,7 @@ impl MediaDeduplicator {
         Ok(())
     }
     
-    fn analyze_rename_candidates(&self, dirs: &[PathBuf]) -> Result<()> {
+    fn analyze_rename_candidates(&mut self, dirs: &[PathBuf]) -> Result<()> {
         let mut file = OpenOptions::new()
             .append(true)
             .open(&self.destructive_script_path)?;
@@ -470,7 +488,13 @@ impl MediaDeduplicator {
                     
                     if conflict {
                         let checksum = self.get_checksum_from_database(&file_path)
-                            .unwrap_or_else(|_| self.calculate_hash(&file_path).unwrap_or_default());
+                            .unwrap_or_else(|_| {
+                                let mut hash = String::new();
+                                if let Ok(h) = self.calculate_hash(&file_path) {
+                                    hash = h;
+                                }
+                                hash
+                            });
                         
                         let hashed_name = self.create_hashed_filename(&clean_name, &checksum);
                         
@@ -500,6 +524,25 @@ impl MediaDeduplicator {
         println!("Cross-directory duplicates: {}", self.cross_dir_dupes_count);
         println!("Filename cleanup candidates: {}", self.rename_candidates);
         println!("");
+        
+        // Display performance metrics
+        let total_time = self.start_time.elapsed();
+        let bytes_processed = ByteSize(self.total_bytes_processed);
+        let throughput = if self.hashing_time.as_secs() > 0 {
+            ByteSize((self.total_bytes_processed as f64 / self.hashing_time.as_secs_f64()) as u64)
+        } else {
+            ByteSize(0)
+        };
+        let memory_usage = ByteSize(self.peak_memory_usage);
+        
+        println!("=== Performance Metrics ===");
+        println!("Total runtime: {}", format_duration(total_time));
+        println!("Hashing time: {}", format_duration(self.hashing_time));
+        println!("Data processed: {}", bytes_processed);
+        println!("Throughput: {}/s", throughput);
+        println!("Peak memory usage: {}", memory_usage);
+        println!("");
+        
         println!("All checksums have been saved to: {}", self.checksum_db_path.display());
         println!("");
         println!("IMPORTANT: Potentially destructive operations have been written to:");
@@ -543,13 +586,33 @@ impl MediaDeduplicator {
         Ok(())
     }
     
-    fn calculate_hash(&self, file_path: &Path) -> Result<String> {
+    fn calculate_hash(&mut self, file_path: &Path) -> Result<String> {
+        // Track hash calculation time
+        let hash_start = Instant::now();
+        
         let mut file = File::open(file_path)?;
         let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
+        let bytes_read = file.read_to_end(&mut buffer)?;
+        
+        // Add to total bytes processed
+        self.total_bytes_processed += bytes_read as u64;
         
         // Use XXH3 hash64 which is extremely fast
         let hash_value = hash64(&buffer);
+        
+        // Track hashing time
+        let elapsed = hash_start.elapsed();
+        self.hashing_time += elapsed;
+        
+        // Update memory usage
+        self.system_info.refresh_all();
+        let pid = std::process::id() as usize;
+        if let Some(process) = self.system_info.process(sysinfo::Pid::from(pid)) {
+            let memory = process.memory();
+            if memory > self.peak_memory_usage {
+                self.peak_memory_usage = memory;
+            }
+        }
         
         // Convert to hex string format
         Ok(format!("{:016x}", hash_value))
