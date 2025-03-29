@@ -2,13 +2,13 @@ use anyhow::{anyhow, Result};
 use chrono::Local;
 use clap::Parser;
 use regex::Regex;
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+use twox_hash::xxh3::hash64;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Media File Deduplication Tool")]
@@ -178,39 +178,18 @@ impl MediaDeduplicator {
             return Ok(());
         }
         
-        let file = File::open(&self.checksum_db_path)?;
-        let reader = BufReader::new(file);
-        
-        for line in reader.lines() {
-            let line = line?;
-            
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            
-            let parts: Vec<&str> = line.splitn(2, "  ").collect();
-            if parts.len() != 2 {
-                continue;
-            }
-            
-            let checksum = parts[0];
-            let filepath = parts[1];
-            
-            if Path::new(filepath).exists() {
-                self.checksum_to_file.insert(checksum.to_string(), filepath.to_string());
-                
-                self.checksum_to_files
-                    .entry(checksum.to_string())
-                    .or_insert_with(Vec::new)
-                    .push(filepath.to_string());
-                
-                let filename = Path::new(filepath).file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                self.basename_map.insert(filename);
-            }
+        // Always start fresh - don't reuse old hash database to avoid stale data
+        // Just create a backup of the old database and start new
+        let backup_path = self.checksum_db_path.with_extension("txt.bak");
+        if self.checksum_db_path.exists() {
+            println!("Backing up old checksum database to {}", backup_path.display());
+            fs::copy(&self.checksum_db_path, &backup_path)?;
+            // Truncate the existing file to start fresh
+            File::create(&self.checksum_db_path)?;
         }
+        
+        // We'll recalculate all hashes for the current files
+        println!("Starting with a fresh checksum database");
         
         Ok(())
     }
@@ -248,16 +227,12 @@ impl MediaDeduplicator {
                     .to_string_lossy()
                     .into_owned();
                 
-                let file_checksum = if self.is_file_in_database(&media_path)? {
-                    self.get_checksum_from_database(&media_path)?
-                } else {
-                    let checksum = self.calculate_sha256(&media_path)?;
-                    println!("Calculating checksum: {} ({}...)", media_filename, &checksum[..8]);
-                    
-                    self.add_to_database(&media_path, &checksum)?;
-                    
-                    checksum
-                };
+                // Always calculate a fresh checksum
+                let file_checksum = self.calculate_hash(&media_path)?;
+                println!("Calculating checksum: {} ({}...)", media_filename, &file_checksum[..8]);
+                
+                // Update the database with the fresh checksum
+                self.add_to_database(&media_path, &file_checksum)?;
                 
                 if !self.checksum_to_file.contains_key(&file_checksum) {
                     self.checksum_to_file.insert(
@@ -495,7 +470,7 @@ impl MediaDeduplicator {
                     
                     if conflict {
                         let checksum = self.get_checksum_from_database(&file_path)
-                            .unwrap_or_else(|_| self.calculate_sha256(&file_path).unwrap_or_default());
+                            .unwrap_or_else(|_| self.calculate_hash(&file_path).unwrap_or_default());
                         
                         let hashed_name = self.create_hashed_filename(&clean_name, &checksum);
                         
@@ -540,21 +515,6 @@ impl MediaDeduplicator {
         println!("To apply these changes, run: bash {}", self.destructive_script_path.display());
     }
     
-    fn is_file_in_database(&self, file_path: &Path) -> Result<bool> {
-        let file = File::open(&self.checksum_db_path)?;
-        let reader = BufReader::new(file);
-        let path_str = file_path.to_string_lossy();
-        
-        for line in reader.lines() {
-            let line = line?;
-            if line.contains(&format!("  {}", path_str)) {
-                return Ok(true);
-            }
-        }
-        
-        Ok(false)
-    }
-    
     fn get_checksum_from_database(&self, file_path: &Path) -> Result<String> {
         let file = File::open(&self.checksum_db_path)?;
         let reader = BufReader::new(file);
@@ -583,16 +543,16 @@ impl MediaDeduplicator {
         Ok(())
     }
     
-    fn calculate_sha256(&self, file_path: &Path) -> Result<String> {
+    fn calculate_hash(&self, file_path: &Path) -> Result<String> {
         let mut file = File::open(file_path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
         
-        let mut hasher = Sha256::new();
-        hasher.update(&buffer);
-        let result = hasher.finalize();
+        // Use XXH3 hash64 which is extremely fast
+        let hash_value = hash64(&buffer);
         
-        Ok(format!("{:x}", result))
+        // Convert to hex string format
+        Ok(format!("{:016x}", hash_value))
     }
     
     fn get_relative_path(&self, path: &Path) -> String {
